@@ -1,18 +1,50 @@
 import os
 import sqlite3
-import time
-from datetime import datetime
 import feedparser
 import yfinance as yf
+from datetime import datetime
 from google import genai
-from google.genai import types
+import urllib.parse
 
 DB_NAME = "uutiset.db"
 
+def luo_google_news_url(hakusana):
+    encoded_query = urllib.parse.quote(hakusana)
+    return f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+
 RSS_FEEDS = {
-    "Suomi": "https://yle.fi/rss/uutiset/paauutiset",
-    "Maailma": "https://www.iltalehti.fi/rss/uutiset.xml",
-    "Talous": "https://www.mtvuutiset.fi/api/feed/rss/uutiset"
+    "Amerikka (USA & Kanada)": [
+        luo_google_news_url("US geopolitics conflict crisis"),
+        luo_google_news_url("United States national security threat")
+    ],
+    "Kiina": [
+        luo_google_news_url("China geopolitics military crisis"),
+        luo_google_news_url("China economy trade war tensions")
+    ],
+    "Venäjä": [
+        luo_google_news_url("Russia conflict war sanctions crisis"),
+        luo_google_news_url("Russia military security policy")
+    ],
+    "Eurooppa": [
+        luo_google_news_url("Europe security crisis conflict"),
+        luo_google_news_url("European Union geopolitical risk")
+    ],
+    "Aasia (Muut)": [
+        luo_google_news_url("Asia Pacific geopolitical tension conflict"),
+        luo_google_news_url("Taiwan South China Sea crisis")
+    ],
+    "Etelä-Amerikka": [
+        luo_google_news_url("South America crisis political unrest"),
+        luo_google_news_url("Latin America economic political conflict")
+    ],
+    "Lähi-itä & Afrikka": [
+        luo_google_news_url("Middle East conflict war crisis"),
+        luo_google_news_url("Africa political crisis conflict")
+    ],
+    "Globaali Talous & Markkinat": [
+        luo_google_news_url("global financial crisis inflation market crash"),
+        luo_google_news_url("global supply chain crisis energy shortage")
+    ]
 }
 
 def alusta_tietokanta():
@@ -25,17 +57,11 @@ def alusta_tietokanta():
             alue TEXT,
             otsikko TEXT,
             kuvaus TEXT,
-            linkki TEXT,
+            linkki TEXT UNIQUE,
             kriisi_indeksi INTEGER,
             analyysi TEXT
         )
     """)
-    # Varmistetaan, että alue-sarake löytyy varmasti myös vanhasta kannasta
-    try:
-        cursor.execute("ALTER TABLE uutiset ADD COLUMN alue TEXT")
-    except sqlite3.OperationalError:
-        pass  # Sarake on jo olemassa
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS markkinat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,47 +75,44 @@ def alusta_tietokanta():
     conn.close()
 
 def hae_ja_analysoi_uutiset():
-    print("Haetaan uutisia alueellisista/teemallisista RSS-syötteistä...")
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("VIRHE: GEMINI_API_KEY-ympäristömuuttuja puuttuu!")
+        print("VIRHE: GEMINI_API_KEY puuttuu!")
         return
 
     client = genai.Client(api_key=api_key)
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
     tanaan = datetime.now().strftime("%Y-%m-%d")
-    laskuri = 0
 
-    for alue, feed_url in RSS_FEEDS.items():
-        print(f"Käsitellään aluetta/teemaa: {alue}")
-        parsed = feedparser.parse(feed_url)
-        
-        for entry in parsed.entries[:2]:
-            otsikko = entry.get("title", "")
-            kuvaus = entry.get("summary", "")
-            linkki = entry.get("link", "")
-            
-            cursor.execute("SELECT id FROM uutiset WHERE linkki = ?", (linkki,))
-            if cursor.fetchone():
-                continue
+    for alue, feed_list in RSS_FEEDS.items():
+        for url in feed_list:
+            parsed = feedparser.parse(url)
+            for entry in parsed.entries[:3]:
+                otsikko = entry.get("title", "")
+                kuvaus = entry.get("summary", "")
+                linkki = entry.get("link", "")
+                
+                if not linkki:
+                    continue
+                
+                cursor.execute("SELECT id FROM uutiset WHERE linkki = ?", (linkki,))
+                if cursor.fetchone():
+                    continue
 
-            prompt = (
-                f"Analysoi seuraava uutinen geopoliittisen ja globaalin taloudellisen epävakauden, kriisien tai uhkien näkökulmasta. "
-                f"Anna sille kriisi-indeksi kokonaislukuna väliltä 1 (täysin rauhallinen / normaali) ja 10 (äärimmäinen kriisi/sota/romahtaminen). "
-                f"Vastaa tarkalleen muodossa: 'INDEKSI: [numero]\nANALYYSI: [lyhyt suomenkielinen perustelu]'.\n\n"
-                f"Otsikko: {otsikko}\nKuvaus: {kuvaus}"
-            )
+                prompt = (
+                    f"Analysoi seuraava uutinen geopoliittisen ja globaalin taloudellisen epävakauden näkökulmasta. "
+                    f"Anna sille kriisi-indeksi kokonaislukuna väliltä 1 (rauhallinen) ja 10 (kriisi/sota). "
+                    f"Vastaa muodossa: 'INDEKSI: [numero]\nANALYYSI: [perustelu]'.\n\n"
+                    f"Otsikko: {otsikko}\nKuvaus: {kuvaus}"
+                )
 
-            for yritys in range(3):
                 try:
                     response = client.models.generate_content(
                         model='gemini-2.5-flash',
                         contents=prompt
                     )
                     vastaus_teksti = response.text
-                    
                     indeksi = 1
                     analyysi = "Ei analyysiä."
                     for r in vastaus_teksti.split("\n"):
@@ -102,28 +125,16 @@ def hae_ja_analysoi_uutiset():
                             analyysi = r.replace("ANALYYSI:", "").strip()
 
                     cursor.execute("""
-                        INSERT INTO uutiset (paivays, alue, otsikko, kuvaus, linkki, kriisi_indeksi, analyysi)
+                        INSERT OR IGNORE INTO uutiset (paivays, alue, otsikko, kuvaus, linkki, kriisi_indeksi, analyysi)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (tanaan, alue, otsikko, kuvaus, linkki, indeksi, analyysi))
-                    laskuri += 1
-                    print(f"  -> [{alue}] Tallennettu: {otsikko[:40]}... (Indeksi: {indeksi})")
-                    break
+                    conn.commit()
                 except Exception as e:
-                    if ("503" in str(e) or "429" in str(e)) and yritys < 2:
-                        print(f"  -> Palvelinruuhka, odotetaan 5s ja yritetään uudelleen ({yritys+1}/3)...")
-                        time.sleep(5)
-                    else:
-                        print(f"  -> Virhe Gemini-analyysissä: {e}")
-                        break
-            
-            time.sleep(2)
+                    print(f"Virhe analyysissä: {e}")
 
-    conn.commit()
     conn.close()
-    print(f"Uutiset käsitelty. Tallennettu {laskuri} uutta uutista.")
 
 def paivita_markkinat():
-    print("Haetaan markkinatietoja (yfinance)...")
     tickers = {
         "^VIX": "VIX (Pelkomittari)",
         "^OMXH25": "OMX Helsinki 25",
@@ -133,14 +144,14 @@ def paivita_markkinat():
         "BZ=F": "Raakaöljy (Brent)",
         "GC=F": "Kulta"
     }
-
+    
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-
+    
     for ticker, nimi in tickers.items():
         try:
             t = yf.Ticker(ticker)
-            hist = t.history(period="5d")
+            hist = t.history(period="1mo")
             if not hist.empty:
                 for index, row in hist.iterrows():
                     paivays = index.strftime("%Y-%m-%d")
@@ -154,16 +165,13 @@ def paivita_markkinat():
                         INSERT INTO markkinat (paivays, nimi, arvo, muutos_prosentti)
                         VALUES (?, ?, ?, ?)
                     """, (paivays, nimi, arvo, 0.0))
-                print(f"  -> Tallennettu markkinatieto: {nimi}")
-        except Exception as e:
-            print(f"  -> Virhe haettaessa {nimi}: {e}")
-
+        except Exception:
+            pass
+            
     conn.commit()
     conn.close()
 
 if __name__ == "__main__":
-    print("Kriisianalysaattori käynnistyy...")
     alusta_tietokanta()
     paivita_markkinat()
     hae_ja_analysoi_uutiset()
-    print("Ajo valmis.")
