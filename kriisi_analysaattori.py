@@ -12,38 +12,22 @@ def luo_google_news_url(hakusana):
     encoded_query = urllib.parse.quote(hakusana)
     return f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
 
+# OPTIMOITU ILMAISRAJALLE: 5 aluetta, joista otetaan 4 uutista = tasan 20 pyyntöä per ajo (maksimi hyöty!)
 RSS_FEEDS = {
-    "Amerikka (USA & Kanada)": [
-        luo_google_news_url("US geopolitics conflict crisis"),
-        luo_google_news_url("United States national security threat")
+    "Amerikka & USA": [
+        luo_google_news_url("US geopolitics conflict crisis")
     ],
-    "Kiina": [
-        luo_google_news_url("China geopolitics military crisis"),
-        luo_google_news_url("China economy trade war tensions")
+    "Kiina & Aasia": [
+        luo_google_news_url("China geopolitics military crisis")
     ],
-    "Venäjä": [
-        luo_google_news_url("Russia conflict war sanctions crisis"),
-        luo_google_news_url("Russia military security policy")
+    "Venäjä & Itä-Eurooppa": [
+        luo_google_news_url("Russia conflict war sanctions crisis")
     ],
     "Eurooppa": [
-        luo_google_news_url("Europe security crisis conflict"),
-        luo_google_news_url("European Union geopolitical risk")
+        luo_google_news_url("Europe security crisis conflict")
     ],
-    "Aasia (Muut)": [
-        luo_google_news_url("Asia Pacific geopolitical tension conflict"),
-        luo_google_news_url("Taiwan South China Sea crisis")
-    ],
-    "Etelä-Amerikka": [
-        luo_google_news_url("South America crisis political unrest"),
-        luo_google_news_url("Latin America economic political conflict")
-    ],
-    "Lähi-itä & Afrikka": [
-        luo_google_news_url("Middle East conflict war crisis"),
-        luo_google_news_url("Africa political crisis conflict")
-    ],
-    "Globaali Talous & Markkinat": [
-        luo_google_news_url("global financial crisis inflation market crash"),
-        luo_google_news_url("global supply chain crisis energy shortage")
+    "Globaali Talous": [
+        luo_google_news_url("global financial crisis inflation market")
     ]
 }
 
@@ -85,10 +69,17 @@ def hae_ja_analysoi_uutiset():
     cursor = conn.cursor()
     tanaan = datetime.now().strftime("%Y-%m-%d")
 
+    kaytetyt_pyynnot = 0
+
     for alue, feed_list in RSS_FEEDS.items():
         for url in feed_list:
             parsed = feedparser.parse(url)
-            for entry in parsed.entries[:3]:
+            # 4 uutista per syöte (5 aluetta * 4 = 20 kutsua, täysi ilmaiskiintiön hyötykäyttö)
+            for entry in parsed.entries[:4]:
+                if kaytetyt_pyynnot >= 20:
+                    print("Päivittäinen ilmaiskiintiön raja (20 pyyntöä) saavutettu tälle ajolle.")
+                    break
+
                 otsikko = entry.get("title", "")
                 kuvaus = entry.get("summary", "")
                 linkki = entry.get("link", "")
@@ -96,6 +87,7 @@ def hae_ja_analysoi_uutiset():
                 if not linkki:
                     continue
                 
+                # Tarkistetaan onko uutinen jo kannassa
                 cursor.execute("SELECT id FROM uutiset WHERE linkki = ?", (linkki,))
                 if cursor.fetchone():
                     continue
@@ -112,6 +104,7 @@ def hae_ja_analysoi_uutiset():
                         model='gemini-2.5-flash',
                         contents=prompt
                     )
+                    kaytetyt_pyynnot += 1
                     vastaus_teksti = response.text
                     indeksi = 1
                     analyysi = "Ei analyysiä."
@@ -129,8 +122,12 @@ def hae_ja_analysoi_uutiset():
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (tanaan, alue, otsikko, kuvaus, linkki, indeksi, analyysi))
                     conn.commit()
+                    print(f"[{kaytetyt_pyynnot}/20] Tallennettu: [{alue}] {otsikko[:35]}...")
                 except Exception as e:
-                    print(f"Virhe analyysissä: {e}")
+                    print(f"Virhe analyysissä ({alue}): {e}")
+
+            if kaytetyt_pyynnot >= 20:
+                break
 
     conn.close()
 
