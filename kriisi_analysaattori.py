@@ -1,157 +1,169 @@
 import os
-import json
 import sqlite3
-import urllib.request
-import urllib.error
 import time
+from datetime import datetime
 import feedparser
-from datetime import datetime, timedelta
-from email.utils import parsedate_to_datetime
+import yfinance as yf
+from google import genai
+from google.genai import types
 
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    print("VIRHE: GEMINI_API_KEY puuttuu! Aja ensin: export GEMINI_API_KEY='sinun_avaimesi'")
-    exit()
+DB_NAME = "uutiset.db"
 
-conn = sqlite3.connect("uutiset.db")
-cursor = conn.cursor()
-
-# Luodaan taulukko ja varmistetaan alue-sarake
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS uutisolio (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        otsikko TEXT UNIQUE,
-        pvm TEXT,
-        lahde TEXT,
-        alue TEXT,
-        kriisi_indeksi REAL
-    )
-''')
-
-try:
-    cursor.execute("ALTER TABLE uutisolio ADD COLUMN alue TEXT")
-except sqlite3.OperationalError:
-    pass
-
-conn.commit()
-
-alueet_syotteet = {
-    "Europe": "https://news.google.com/rss/search?q=geopolitics+crisis+Europe&hl=en-US&gl=US&ceid=US:en",
-    "Asia": "https://news.google.com/rss/search?q=geopolitics+crisis+Asia&hl=en-US&gl=US&ceid=US:en",
-    "Middle East": "https://news.google.com/rss/search?q=geopolitics+crisis+Middle+East&hl=en-US&gl=US&ceid=US:en",
-    "North America": "https://news.google.com/rss/search?q=geopolitics+crisis+North+America&hl=en-US&gl=US&ceid=US:en",
-    "Africa": "https://news.google.com/rss/search?q=geopolitics+crisis+Africa&hl=en-US&gl=US&ceid=US:en"
+RSS_FEEDS = {
+    "Suomi": "https://yle.fi/rss/uutiset/paauutiset",
+    "Maailma": "https://www.iltalehti.fi/rss/uutiset.xml",
+    "Talous": "https://www.mtvuutiset.fi/api/feed/rss/uutiset"
 }
 
-url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
+def alusta_tietokanta():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uutiset (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paivays TEXT,
+            alue TEXT,
+            otsikko TEXT,
+            kuvaus TEXT,
+            linkki TEXT,
+            kriisi_indeksi INTEGER,
+            analyysi TEXT
+        )
+    """)
+    # Varmistetaan, että alue-sarake löytyy varmasti myös vanhasta kannasta
+    try:
+        cursor.execute("ALTER TABLE uutiset ADD COLUMN alue TEXT")
+    except sqlite3.OperationalError:
+        pass  # Sarake on jo olemassa
 
-print("=== ALOITETAAN KRIISIANALYYSI ===\n")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS markkinat (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paivays TEXT,
+            nimi TEXT,
+            arvo REAL,
+            muutos_prosentti REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-uudet_yhteensa = 0
-vanhat_yhteensa = 0
+def hae_ja_analysoi_uutiset():
+    print("Haetaan uutisia alueellisista/teemallisista RSS-syötteistä...")
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("VIRHE: GEMINI_API_KEY-ympäristömuuttuja puuttuu!")
+        return
 
-for alue, rss_url in alueet_syotteet.items():
-    feed = feedparser.parse(rss_url)
-    uutiset = feed.entries
-    yhteensa_alueella = len(uutiset)
+    client = genai.Client(api_key=api_key)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
     
-    uudet_alueella = 0
-    vanhat_alueella = 0
-    
-    print(f"\n--- Alue: {alue} ({yhteensa_alueella} uutista) ---")
+    tanaan = datetime.now().strftime("%Y-%m-%d")
+    laskuri = 0
 
-    for i, entry in enumerate(uutiset, 1):
-        otsikko = entry.title
+    for alue, feed_url in RSS_FEEDS.items():
+        print(f"Käsitellään aluetta/teemaa: {alue}")
+        parsed = feedparser.parse(feed_url)
         
-        # Jäsennetään julkaisupäivämäärä
-        pvm_raaka = getattr(entry, 'published', None)
-        if pvm_raaka:
-            try:
-                dt = parsedate_to_datetime(pvm_raaka)
-                pvm_pvm = dt.strftime('%Y-%m-%d')
-            except Exception:
-                pvm_pvm = datetime.now().strftime('%Y-%m-%d')
-        else:
-            pvm_pvm = datetime.now().strftime('%Y-%m-%d')
+        for entry in parsed.entries[:2]:
+            otsikko = entry.get("title", "")
+            kuvaus = entry.get("summary", "")
+            linkki = entry.get("link", "")
+            
+            cursor.execute("SELECT id FROM uutiset WHERE linkki = ?", (linkki,))
+            if cursor.fetchone():
+                continue
 
-        cursor.execute("SELECT id FROM uutisolio WHERE otsikko = ?", (otsikko,))
-        if cursor.fetchone():
-            vanhat_alueella += 1
-            vanhat_yhteensa += 1
-            print(f"[{i}/{yhteensa_alueella}] [OHITETTU - Kannassa]: {otsikko[:40]}...")
-            continue
+            prompt = (
+                f"Analysoi seuraava uutinen geopoliittisen ja globaalin taloudellisen epävakauden, kriisien tai uhkien näkökulmasta. "
+                f"Anna sille kriisi-indeksi kokonaislukuna väliltä 1 (täysin rauhallinen / normaali) ja 10 (äärimmäinen kriisi/sota/romahtaminen). "
+                f"Vastaa tarkalleen muodossa: 'INDEKSI: [numero]\nANALYYSI: [lyhyt suomenkielinen perustelu]'.\n\n"
+                f"Otsikko: {otsikko}\nKuvaus: {kuvaus}"
+            )
 
-        prompt = f"Olet kriisianalyytikko. Arvioi uutisen vakavuus asteikolla 1.0-10.0 (1.0=normaali, 10.0=sota/katastrofi). Otsikko: '{otsikko}'. Palauta AINOASTAAN pelkkä numero."
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        
-        for yritys in range(2):
-            try:
-                req = urllib.request.Request(
-                    url, 
-                    data=json.dumps(payload).encode('utf-8'),
-                    headers={'Content-Type': 'application/json'}
-                )
-                
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    result = json.loads(response.read().decode('utf-8'))
-                    vastaus_teksti = result['candidates'][0]['content']['parts'][0]['text'].strip()
-                    kriisi_pisteet = float(vastaus_teksti)
+            for yritys in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt
+                    )
+                    vastaus_teksti = response.text
                     
-                    cursor.execute('''
-                        INSERT INTO uutisolio (otsikko, pvm, lahde, alue, kriisi_indeksi)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (otsikko, pvm_pvm, "Google News", alue, kriisi_pisteet))
-                    conn.commit()
-                    
-                    uudet_alueella += 1
-                    uudet_yhteensa += 1
-                    print(f"[{i}/{yhteensa_alueella}] [UUSI ({pvm_pvm}) - {kriisi_pisteet}]: {otsikko[:35]}...")
-                    time.sleep(0.2)
+                    indeksi = 1
+                    analyysi = "Ei analyysiä."
+                    for r in vastaus_teksti.split("\n"):
+                        if "INDEKSI:" in r:
+                            import re
+                            numerot = re.findall(r'\d+', r)
+                            if numerot:
+                                indeksi = int(numerot[0])
+                        elif "ANALYYSI:" in r:
+                            analyysi = r.replace("ANALYYSI:", "").strip()
+
+                    cursor.execute("""
+                        INSERT INTO uutiset (paivays, alue, otsikko, kuvaus, linkki, kriisi_indeksi, analyysi)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (tanaan, alue, otsikko, kuvaus, linkki, indeksi, analyysi))
+                    laskuri += 1
+                    print(f"  -> [{alue}] Tallennettu: {otsikko[:40]}... (Indeksi: {indeksi})")
                     break
-                    
-            except urllib.error.HTTPError as e:
-                if e.code in [503, 429]:
-                    time.sleep(1)
-                else:
-                    break
-            except Exception:
-                break
+                except Exception as e:
+                    if ("503" in str(e) or "429" in str(e)) and yritys < 2:
+                        print(f"  -> Palvelinruuhka, odotetaan 5s ja yritetään uudelleen ({yritys+1}/3)...")
+                        time.sleep(5)
+                    else:
+                        print(f"  -> Virhe Gemini-analyysissä: {e}")
+                        break
+            
+            time.sleep(2)
 
-    print(f"-> {alue} valmis: {uudet_alueella} uutta, {vanhat_alueella} vanhaa.")
+    conn.commit()
+    conn.close()
+    print(f"Uutiset käsitelty. Tallennettu {laskuri} uutta uutista.")
 
-# --- AUTOMATISOITU SIIVOUS JA MUOTOILU ---
-cursor.execute("SELECT id, pvm FROM uutisolio")
-for rivi_id, pvm_str in cursor.fetchall():
-    if pvm_str and "," in pvm_str:
+def paivita_markkinat():
+    print("Haetaan markkinatietoja (yfinance)...")
+    tickers = {
+        "^VIX": "VIX (Pelkomittari)",
+        "^OMXH25": "OMX Helsinki 25",
+        "^STOXX50E": "Euro Stoxx 50",
+        "^N225": "Nikkei 225",
+        "^GSPC": "S&P 500",
+        "BZ=F": "Raakaöljy (Brent)",
+        "GC=F": "Kulta"
+    }
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    for ticker, nimi in tickers.items():
         try:
-            dt = parsedate_to_datetime(pvm_str)
-            cursor.execute("UPDATE uutisolio SET pvm = ? WHERE id = ?", (dt.strftime('%Y-%m-%d'), rivi_id))
-        except Exception:
-            pass
+            t = yf.Ticker(ticker)
+            hist = t.history(period="5d")
+            if not hist.empty:
+                for index, row in hist.iterrows():
+                    paivays = index.strftime("%Y-%m-%d")
+                    arvo = float(row["Close"])
+                    
+                    cursor.execute("SELECT id FROM markkinat WHERE paivays = ? AND nimi = ?", (paivays, nimi))
+                    if cursor.fetchone():
+                        continue
 
-# Poistetaan yli 90vrk vanhat
-raja_pvm = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
-cursor.execute("DELETE FROM uutisolio WHERE pvm < ?", (raja_pvm,))
-conn.commit()
+                    cursor.execute("""
+                        INSERT INTO markkinat (paivays, nimi, arvo, muutos_prosentti)
+                        VALUES (?, ?, ?, ?)
+                    """, (paivays, nimi, arvo, 0.0))
+                print(f"  -> Tallennettu markkinatieto: {nimi}")
+        except Exception as e:
+            print(f"  -> Virhe haettaessa {nimi}: {e}")
 
-# --- TULOSTETAAN TAULUKKO ALUEEN KANSSA ---
-print("\n" + "="*85)
-print(f"AJON TULOKSET: {uudet_yhteensa} uutta | {vanhat_yhteensa} vanhaa | Kanta siivottu")
-print("="*85)
-print(f"{'ID':<5} | {'ALUE':<15} | {'INDEKSI':<8} | {'PVM':<10} | {'OTSIKKO'}")
-print("="*85)
+    conn.commit()
+    conn.close()
 
-cursor.execute('''
-    SELECT id, COALESCE(alue, 'Tuntematon'), kriisi_indeksi, pvm, otsikko 
-    FROM uutisolio 
-    ORDER BY id DESC 
-    LIMIT 15
-''')
-
-for rivi in cursor.fetchall():
-    u_id, u_alue, u_indeksi, u_pvm, u_otsikko = rivi
-    print(f"{u_id:<5} | {u_alue:<15} | {u_indeksi:<8.1f} | {u_pvm:<10} | {u_otsikko[:35]}...")
-
-print("="*85)
-
-conn.close()
+if __name__ == "__main__":
+    print("Kriisianalysaattori käynnistyy...")
+    alusta_tietokanta()
+    paivita_markkinat()
+    hae_ja_analysoi_uutiset()
+    print("Ajo valmis.")
